@@ -1,0 +1,296 @@
+﻿// ================================================================
+//  [티케이엔텍] 1 CMM 소형 바이오탈취기 통합 제어 FB
+//  문서번호 : TK-2026-PLC-002
+//  대상 PLC : LS ELECTRIC XEC-DN32H / XG5000
+//  언어     : ST (Structured Text, IEC 61131-3 기반)
+//
+//  [XEC 변환 내역]
+//   A. Siemens S7 전용 속성 및 따옴표 FB명을 XG5000용 일반 FB 선언으로 변경
+//   B. TIA Portal 전용 독립 CONST 섹션을 초기값 보유 VAR 영역으로 이동
+//   C. NORM_X/SCALE_X 호출을 XEC에서 이식 가능한 산술 스케일링식으로 변경
+//   D. Siemens RS 파라미터명 의존성을 제거하고 래치 로직을 ST 대입식으로 구현
+//   E. 원격 펄스/리셋/모드 판정을 본문 앞쪽으로 이동하여 스캔 순서 오류를 방지
+//   F. XEC 변수명 규칙 준수를 위해 변수명에 점(.)을 사용하지 않음
+// ================================================================
+
+FUNCTION_BLOCK FB_TK_OdorControl
+
+// ---------------------------------------------------------------
+//  입력 (현장 계측기 -> PLC)
+// ---------------------------------------------------------------
+VAR_INPUT
+    iRaw_DiffPressure     : INT;     // 차압계 Raw (0~27648, 0~300 mmAq)
+    iRaw_TDS              : INT;     // TDS 센서 Raw (0~27648, 0~10000 mg/L)
+    iRaw_Humidity_S1      : INT;     // 습도센서 1단 Raw (0~27648, 0~100%)
+    iRaw_Humidity_S2      : INT;     // 습도센서 2단 Raw (0~27648, 0~100%)
+    iRaw_SumpTemp         : INT;     // 집수조 수온 Raw (0~27648, -20~80 degC)
+    iRaw_AmbientTemp      : INT;     // 외기온 Raw (0~27648, -20~80 degC)
+    iRaw_pH               : INT;     // pH 센서 Raw (참고용)
+
+    xSumpLevel_Low        : BOOL;    // 집수조 저수위 스위치 (TRUE=저수위)
+    xSumpLevel_High       : BOOL;    // 집수조 고수위 스위치 (TRUE=만수위)
+    xManualMode_SW        : BOOL;    // 현장 수동/자동 선택 스위치 (TRUE=자동)
+    xAlarmReset_PB        : BOOL;    // 알람 리셋 푸시버튼
+
+    rDesignArea_m2        : REAL;    // 설계 단면적 [m2]
+    rDesignFlow_CMM       : REAL;    // 설계 풍량 [CMM]
+
+    xRemoteMode_Cmd       : BOOL;    // 원격모드 전환 명령
+    xRemote_PumpStart     : BOOL;    // 원격 강제 살수 시작 펄스
+    xRemote_DrainStart    : BOOL;    // 원격 강제 드레인 시작 펄스
+    xRemote_AlarmReset    : BOOL;    // 원격 알람 리셋 펄스
+    xComm_Heartbeat       : BOOL;    // SCADA 통신 하트비트 토글 신호
+END_VAR
+
+// ---------------------------------------------------------------
+//  출력 (PLC -> 현장 액추에이터 및 감시값)
+// ---------------------------------------------------------------
+VAR_OUTPUT
+    xBlowerRun            : BOOL;    // 송풍기 기동 출력
+    xPumpRun              : BOOL;    // 살수순환펌프 기동 출력
+    xHeaterRun            : BOOL;    // 동파방지 이머젼 히터 출력
+    xValveDrain           : BOOL;    // 드레인 솔레노이드밸브
+    xValveMakeup          : BOOL;    // 보급수 솔레노이드밸브
+    xValveBackwash        : BOOL;    // 역세용 솔레노이드밸브
+
+    xAlarm_DP_High        : BOOL;    // 차압 고 비상정지 알람
+    xAlarm_DP_Backwash    : BOOL;    // 차압 역세권고 알람
+    xAlarm_SumpLow        : BOOL;    // 집수조 저수위 알람
+    xAlarm_HeaterFault    : BOOL;    // 히터 고온 폭주 알람
+    xAlarm_SensorFault    : BOOL;    // 센서 단선/이상치 알람
+    xAlarm_CommLost       : BOOL;    // SCADA 통신 단절 알람
+    xAlarm_pHBreakthrough : BOOL;    // 파과 조기경보
+    xAlarm_PumpOverrun    : BOOL;    // 살수펌프 최대시간 초과 알람
+
+    rDiffPressure         : REAL;    // 차압값 [mmAq]
+    rTDS_Value            : REAL;    // TDS값 [mg/L]
+    rHumidity_S1          : REAL;    // 1단 습도 [%]
+    rHumidity_S2          : REAL;    // 2단 습도 [%]
+    rSumpTemp             : REAL;    // 집수조 수온 [degC]
+    rAmbientTemp          : REAL;    // 외기온 [degC]
+    rEBCT_Check           : REAL;    // 실시간 EBCT 추정치 [s]
+END_VAR
+
+// ---------------------------------------------------------------
+//  내부 변수 및 설정값
+//  XG5000에서 독립 CONST 선언 호환성이 불명확하므로 초기값 VAR로 둔다.
+// ---------------------------------------------------------------
+VAR
+    EBCT_TARGET_S         : REAL := 15.0;
+    LV_DESIGN_MS          : REAL := 0.0556;
+    H_TOTAL_MEDIA_M       : REAL := 0.833;
+    DP_NORMAL_MAX         : REAL := 80.0;
+    DP_BACKWASH_TRIGGER   : REAL := 100.0;
+    DP_SHUTDOWN           : REAL := 150.0;
+    DP_RATE_ALARM_MMH     : REAL := 5.0;
+    TDS_DRAIN_START       : REAL := 4000.0;
+    TDS_DRAIN_STOP        : REAL := 1500.0;
+    HUMID_LOW_SETPOINT    : REAL := 70.0;
+    HUMID_HIGH_SETPOINT   : REAL := 80.0;
+    HEATER_ON_TEMP        : REAL := 5.0;
+    HEATER_OFF_TEMP       : REAL := 8.0;
+    HEATER_FAULT_TEMP     : REAL := 45.0;
+    AMBIENT_PREHEAT_TEMP  : REAL := 0.0;
+    PUMP_MIN_RUN_SEC      : TIME := T#30S;
+    PUMP_MAX_RUN_SEC      : TIME := T#600S;
+    DRAIN_SEQ_DELAY       : TIME := T#10S;
+    COMM_WATCHDOG_T       : TIME := T#5S;
+    HEATER_MIN_OFF_SEC    : TIME := T#60S;
+
+    xIsAutoMode           : BOOL;
+    xRemoteModeActive     : BOOL;
+
+    xRemotePumpPulse      : BOOL;
+    xRemoteDrainPulse     : BOOL;
+    xAlarmResetPulse      : BOOL;
+    xCommHeartbeatPulse   : BOOL;
+    xPumpMinDone          : BOOL;
+    xPumpMaxDone          : BOOL;
+    xDrainDelayDone       : BOOL;
+    xCommWatchdogDone     : BOOL;
+    xHeaterMinOffDone     : BOOL;
+
+    trig_RemotePump       : R_TRIG;
+    trig_RemoteDrain      : R_TRIG;
+    trig_AlarmReset       : R_TRIG;
+    trig_CommHeartbeat    : R_TRIG;
+
+    ton_PumpMinRun        : TON;
+    ton_PumpMaxRun        : TON;
+    ton_DrainSequence     : TON;
+    ton_CommWatchdog      : TON;
+    ton_HeaterMinOff      : TON;
+
+    iDrainSeqState        : INT;     // 0=대기, 1=배수중, 2=보급중, 3=완료대기
+
+    xSensorFault_DP       : BOOL;
+    xSensorFault_TDS      : BOOL;
+    xSensorFault_Hum      : BOOL;
+    xSensorFault_Temp     : BOOL;
+
+    rDP_Trend_Prev        : REAL;
+    rDP_Trend_RateOfRise  : REAL;
+END_VAR
+
+// ===============================================================
+//  본문 로직
+// ===============================================================
+
+// [STEP 0] 펄스 및 운전 모드 판정
+trig_RemotePump(CLK := xRemote_PumpStart, Q => xRemotePumpPulse);
+trig_RemoteDrain(CLK := xRemote_DrainStart, Q => xRemoteDrainPulse);
+trig_AlarmReset(CLK := xAlarmReset_PB OR xRemote_AlarmReset, Q => xAlarmResetPulse);
+trig_CommHeartbeat(CLK := xComm_Heartbeat, Q => xCommHeartbeatPulse);
+
+xIsAutoMode := xManualMode_SW;
+
+// [STEP 1] 아날로그 입력 스케일링
+rDiffPressure := INT_TO_REAL(iRaw_DiffPressure) * 300.0 / 27648.0;
+rTDS_Value    := INT_TO_REAL(iRaw_TDS) * 10000.0 / 27648.0;
+rHumidity_S1  := INT_TO_REAL(iRaw_Humidity_S1) * 100.0 / 27648.0;
+rHumidity_S2  := INT_TO_REAL(iRaw_Humidity_S2) * 100.0 / 27648.0;
+rSumpTemp     := (INT_TO_REAL(iRaw_SumpTemp) * 100.0 / 27648.0) - 20.0;
+rAmbientTemp  := (INT_TO_REAL(iRaw_AmbientTemp) * 100.0 / 27648.0) - 20.0;
+
+// [STEP 2] 센서 Fail-safe 검증
+xSensorFault_DP   := (iRaw_DiffPressure <= 0) OR (rDiffPressure > 310.0);
+xSensorFault_TDS  := (iRaw_TDS <= 0) OR (rTDS_Value > 10200.0);
+xSensorFault_Hum  := (rHumidity_S1 < 0.0) OR (rHumidity_S1 > 101.0)
+                  OR (rHumidity_S2 < 0.0) OR (rHumidity_S2 > 101.0);
+xSensorFault_Temp := (rSumpTemp < -25.0) OR (rSumpTemp > 90.0);
+
+xAlarm_SensorFault := xSensorFault_DP OR xSensorFault_TDS OR xSensorFault_Hum OR xSensorFault_Temp;
+
+// [STEP 3] EBCT 실시간 모니터링
+IF (rDesignFlow_CMM > 0.0) AND (rDesignArea_m2 > 0.0) THEN
+    rEBCT_Check := H_TOTAL_MEDIA_M / ((rDesignFlow_CMM / 60.0) / rDesignArea_m2);
+ELSE
+    rEBCT_Check := 0.0;
+END_IF;
+
+// [STEP 4] 차압 관리
+rDP_Trend_RateOfRise := (rDiffPressure - rDP_Trend_Prev) * 3600.0;
+rDP_Trend_Prev := rDiffPressure;
+xAlarm_pHBreakthrough := (rDP_Trend_RateOfRise > DP_RATE_ALARM_MMH) AND NOT xSensorFault_DP;
+
+xAlarm_DP_Backwash := (rDiffPressure >= DP_BACKWASH_TRIGGER)
+                   AND (rDiffPressure < DP_SHUTDOWN)
+                   AND NOT xSensorFault_DP;
+xValveBackwash := xAlarm_DP_Backwash AND xIsAutoMode;
+
+IF xAlarmResetPulse THEN
+    xAlarm_DP_High := FALSE;
+ELSIF (rDiffPressure >= DP_SHUTDOWN) AND NOT xSensorFault_DP THEN
+    xAlarm_DP_High := TRUE;
+END_IF;
+
+// [STEP 5] 송풍기 제어
+IF xAlarm_DP_High OR xAlarm_SensorFault THEN
+    xBlowerRun := FALSE;
+ELSIF xIsAutoMode THEN
+    xBlowerRun := TRUE;
+ELSE
+    xBlowerRun := FALSE;
+END_IF;
+
+// [STEP 6] 살수펌프 제어
+ton_PumpMinRun(IN := xPumpRun, PT := PUMP_MIN_RUN_SEC, Q => xPumpMinDone);
+ton_PumpMaxRun(IN := xPumpRun, PT := PUMP_MAX_RUN_SEC, Q => xPumpMaxDone);
+
+xAlarm_PumpOverrun := xPumpMaxDone;
+
+IF xIsAutoMode AND NOT xAlarm_SensorFault THEN
+    IF (rHumidity_S1 < HUMID_LOW_SETPOINT) OR (rHumidity_S2 < HUMID_LOW_SETPOINT) THEN
+        xPumpRun := TRUE;
+    ELSIF (rHumidity_S1 >= HUMID_HIGH_SETPOINT)
+       AND (rHumidity_S2 >= HUMID_HIGH_SETPOINT)
+       AND xPumpMinDone THEN
+        xPumpRun := FALSE;
+    END_IF;
+
+    IF xAlarm_PumpOverrun THEN
+        xPumpRun := FALSE;
+    END_IF;
+ELSE
+    xPumpRun := FALSE;
+END_IF;
+
+// [STEP 7] 동파방지 히터 제어
+ton_HeaterMinOff(IN := NOT xHeaterRun, PT := HEATER_MIN_OFF_SEC, Q => xHeaterMinOffDone);
+
+xAlarm_HeaterFault := (rSumpTemp >= HEATER_FAULT_TEMP) AND NOT xSensorFault_Temp;
+
+IF xAlarm_HeaterFault OR xSensorFault_Temp THEN
+    xHeaterRun := FALSE;
+ELSIF (rSumpTemp <= HEATER_ON_TEMP) OR (rAmbientTemp <= AMBIENT_PREHEAT_TEMP) THEN
+    IF xHeaterMinOffDone THEN
+        xHeaterRun := TRUE;
+    END_IF;
+ELSIF rSumpTemp >= HEATER_OFF_TEMP THEN
+    xHeaterRun := FALSE;
+END_IF;
+
+// [STEP 8] TDS 드레인 시퀀스
+ton_DrainSequence(IN := (iDrainSeqState = 1) AND (rTDS_Value < TDS_DRAIN_STOP), PT := DRAIN_SEQ_DELAY, Q => xDrainDelayDone);
+
+CASE iDrainSeqState OF
+    0:
+        xValveDrain  := FALSE;
+        xValveMakeup := FALSE;
+        IF (rTDS_Value >= TDS_DRAIN_START) AND NOT xSensorFault_TDS AND xIsAutoMode THEN
+            iDrainSeqState := 1;
+        END_IF;
+
+    1:
+        xValveDrain  := TRUE;
+        xValveMakeup := FALSE;
+        IF xDrainDelayDone THEN
+            iDrainSeqState := 2;
+        END_IF;
+        IF xSumpLevel_Low THEN
+            iDrainSeqState := 0;
+            xAlarm_SumpLow := TRUE;
+        END_IF;
+
+    2:
+        xValveDrain  := FALSE;
+        xValveMakeup := TRUE;
+        IF xSumpLevel_High THEN
+            iDrainSeqState := 3;
+        END_IF;
+
+    3:
+        xValveDrain  := FALSE;
+        xValveMakeup := FALSE;
+        iDrainSeqState := 0;
+
+    ELSE
+        iDrainSeqState := 0;
+END_CASE;
+
+xAlarm_SumpLow := xSumpLevel_Low;
+
+// [STEP 9] SCADA 통신 워치독
+ton_CommWatchdog(IN := NOT xCommHeartbeatPulse, PT := COMM_WATCHDOG_T, Q => xCommWatchdogDone);
+
+IF xCommWatchdogDone THEN
+    xAlarm_CommLost := TRUE;
+    xRemoteModeActive := FALSE;
+ELSE
+    xAlarm_CommLost := FALSE;
+    xRemoteModeActive := xRemoteMode_Cmd;
+END_IF;
+
+// [STEP 10] 원격 명령 처리
+IF xRemoteModeActive THEN
+    IF xRemotePumpPulse THEN
+        xPumpRun := TRUE;
+    END_IF;
+
+    IF xRemoteDrainPulse AND (iDrainSeqState = 0) THEN
+        iDrainSeqState := 1;
+    END_IF;
+END_IF;
+
+END_FUNCTION_BLOCK
+
